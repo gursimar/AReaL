@@ -203,26 +203,44 @@ class VLLMWorkerExtension:
             )
             logger.info(f"Found LoRA model with {len(lora_model.loras)} LoRA modules")
 
-            # Receive all weights via XCCL broadcast
+            # Receive all weights via XCCL broadcast.
+            # Phase 1: launch all broadcasts with async_op=True so the Python thread
+            # does not block on each collective individually.
             logger.info(f"Receiving {len(names)} LoRA parameters via XCCL")
-            received_weights = {}
+            gpu_tensors: list[tuple[str, torch.Tensor]] = []
+            work_handles = []
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-
                 tensor = torch.empty(
                     shape, dtype=target_dtype, device=self.model_runner.device
                 )
-
-                torch.distributed.broadcast(
+                handle = torch.distributed.broadcast(
                     tensor,
                     src=0,
                     group=group,
-                    async_op=False,
+                    async_op=True,
                 )
+                gpu_tensors.append((name, tensor))
+                work_handles.append(handle)
 
-                received_weights[name] = tensor.cpu()
+            # Phase 2: wait for each broadcast, then issue a truly non-blocking
+            # GPU→CPU DMA transfer using pinned (page-locked) host memory.
+            # Pinned memory is required for the copy to be asynchronous; ordinary
+            # pageable memory (e.g. tensor.to("cpu", non_blocking=True)) causes the
+            # runtime to fall back to a synchronous transfer regardless of the flag.
+            cpu_tensors: list[tuple[str, torch.Tensor]] = []
+            for handle, (name, tensor) in zip(work_handles, gpu_tensors):
+                handle.wait()
+                cpu_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                cpu_tensor.copy_(tensor, non_blocking=True)
+                cpu_tensors.append((name, cpu_tensor))
+
+            # One synchronize drains all queued DMA transfers before the CPU tensors
+            # are consumed by LoRAModel.from_lora_tensors.
+            current_platform.synchronize()
+            received_weights = {name: cpu_tensor for name, cpu_tensor in cpu_tensors}
 
             logger.info(f"Received {len(received_weights)} LoRA parameters via XCCL")
 
